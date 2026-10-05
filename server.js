@@ -17,6 +17,12 @@
  *    批内前项受影响时后项引用一并拦截，整批不落库）。历史记录与更正不受影响，
  *    更正成功后影响范围按当前来源关系重算。隔离状态变动使台账版本递增，
  *    未使用的批次提交 / 更正确认凭据失效；已成功提交的相同请求重试沿用原幂等结果。
+ *  - 证据封存：凭唯一封存号把某个已登记瓶在当前已提交台账状态下的形成证据
+ *    （完整来源谱系、各形成操作时间与取用量、当时余量、精确原瓶贡献、隔离命中）
+ *    原样固化到 evidence_seals 表并计算 SHA-256 内容摘要。封存只读台账、只写证据表，
+ *    不递增台账版本，已发放凭据不受影响；同号同目标重试幂等返回原封存，同号异目标 409，
+ *    目标不存在或取证失败不占号；封存内容永不随后续分装 / 更正 / 隔离变动改写，
+ *    比较时用与封存相同的构建器从当前台账重算并逐项对照（未变化项不列出）。
  *  - better-sqlite3 为同步驱动，所有写操作包裹在事务中串行执行，
  *    并发请求争用同一来源瓶时天然保证体积守恒。
  */
@@ -80,6 +86,14 @@ CREATE TABLE IF NOT EXISTS quarantines (
   bottle_id  TEXT PRIMARY KEY REFERENCES bottles(id),  -- 仅已登记原始瓶可隔离（写入时校验）
   reason     TEXT NOT NULL,                            -- 隔离原因（非空）
   updated_at TEXT NOT NULL                             -- 最近一次设置 / 更新原因的时刻（ISO 字符串）
+);
+CREATE TABLE IF NOT EXISTS evidence_seals (
+  seal_id        TEXT PRIMARY KEY,
+  bottle_id      TEXT NOT NULL,                   -- 被封存的目标瓶
+  ledger_version INTEGER NOT NULL,                -- 封存时的台账版本（证据取自该已提交状态）
+  sealed_at      TEXT NOT NULL,                   -- 封存时刻（ISO 字符串）
+  digest         TEXT NOT NULL,                   -- 内容摘要：证据规范化 JSON 的 SHA-256
+  evidence       TEXT NOT NULL                    -- 完整证据 JSON（原样保存，永不更新）
 );
 CREATE TABLE IF NOT EXISTS meta (
   key   TEXT PRIMARY KEY,
@@ -158,6 +172,9 @@ const qQuarAll = db.prepare('SELECT * FROM quarantines ORDER BY bottle_id');
 const qQuarIns = db.prepare('INSERT INTO quarantines (bottle_id, reason, updated_at) VALUES (?, ?, ?)');
 const qQuarUpd = db.prepare('UPDATE quarantines SET reason = ?, updated_at = ? WHERE bottle_id = ?');
 const qQuarDel = db.prepare('DELETE FROM quarantines WHERE bottle_id = ?');
+const qSealGet = db.prepare('SELECT * FROM evidence_seals WHERE seal_id = ?');
+const qSealAll = db.prepare('SELECT * FROM evidence_seals ORDER BY sealed_at, seal_id');
+const qSealIns = db.prepare('INSERT INTO evidence_seals (seal_id, bottle_id, ledger_version, sealed_at, digest, evidence) VALUES (?, ?, ?, ?, ?, ?)');
 
 /**
  * 台账版本号：任何写操作（登记原瓶 / 单条操作 / 更正 / 批次提交）成功提交后递增。
@@ -929,6 +946,236 @@ const confirmCorrection = db.transaction((opId, sources, token) => {
   return response;
 });
 
+// ---------------------------------------------------------------- 证据封存（质检复核）
+
+/** 规范化 JSON（对象键序稳定），用于内容摘要，保证同一证据内容的摘要恒定。 */
+function canonicalJson(v) {
+  if (v === null || typeof v !== 'object') return JSON.stringify(v);
+  if (Array.isArray(v)) return '[' + v.map(canonicalJson).join(',') + ']';
+  return '{' + Object.keys(v).sort().map((k) => JSON.stringify(k) + ':' + canonicalJson(v[k])).join(',') + '}';
+}
+const sha256Hex = (s) => crypto.createHash('sha256').update(s).digest('hex');
+
+/**
+ * 收集目标瓶向上至原瓶的全部形成操作（扁平化）及来源链上的全部瓶编号。
+ * 返回 { bottles: [...含目标瓶与全部祖先，按编号排序...], ops: [...按 (操作时间, 操作号) 排序...] }。
+ * 谱系不完整（来源瓶未登记 / 衍生瓶缺少形成操作）时抛错，由调用方按“取证失败”处理（不占号）；
+ * 循环引用由贡献量索引（buildCompositionIndex）在后续构建证据时检出。
+ */
+function collectFormation(bottleId) {
+  const bottles = new Set();
+  const ops = [];
+  const queue = [bottleId];
+  while (queue.length) {
+    const cur = queue.shift();
+    if (bottles.has(cur)) continue;
+    bottles.add(cur);
+    const b = qBottle.get(cur);
+    if (!b) {
+      throw new ApiError(409, 'LINEAGE_BROKEN',
+        `瓶 ${cur} 的来源谱系不完整（来源瓶未登记），无法固化形成证据`);
+    }
+    if (b.kind === 'original') continue;
+    const op = db.prepare('SELECT op_id, op_time, target_bottle FROM operations WHERE target_bottle = ?').get(cur);
+    if (!op) {
+      throw new ApiError(409, 'LINEAGE_BROKEN',
+        `瓶 ${cur} 的来源谱系不完整（缺少形成操作记录），无法固化形成证据`);
+    }
+    const srcs = qOpSources.all(op.op_id);
+    ops.push({
+      op_id: op.op_id, op_time: op.op_time, target_bottle: op.target_bottle,
+      sources: srcs.map((s) => ({ bottle: s.source_bottle, volume: s.volume })),
+    });
+    for (const s of srcs) queue.push(s.source_bottle);
+  }
+  ops.sort((a, b) => (a.op_time < b.op_time ? -1 : a.op_time > b.op_time ? 1
+    : a.op_id < b.op_id ? -1 : a.op_id > b.op_id ? 1 : 0));
+  return { bottles: [...bottles].sort(), ops };
+}
+
+/**
+ * 从当前已提交台账状态构建目标瓶的形成证据。封存与“与现况比较”共用同一构建器，
+ * 保证比较时重算的口径与封存时完全一致。证据内容：
+ *  - lineage：向上至原瓶的完整来源谱系（树）；
+ *  - formation_ops：各形成操作的操作号、时间、目标瓶、来源瓶与取用量（扁平化）；
+ *  - balances：目标瓶及来源链各瓶的当时余量；
+ *  - contributions：精确原瓶贡献（沿用约分分数 mL 格式）；
+ *  - quarantine：目标瓶自身隔离状态与命中的隔离原瓶及原因。
+ * 瓶不存在 → 404；谱系不完整 / 循环 → 409（取证失败，调用方不得占号）。
+ */
+function buildEvidence(bottleId) {
+  const b = qBottle.get(bottleId);
+  if (!b) throw new ApiError(404, 'BOTTLE_NOT_FOUND', `瓶 ${bottleId} 不存在`);
+  const { bottles: chainBottles, ops } = collectFormation(bottleId);
+  const { balances } = recompute();
+  const impact = quarantineImpactMap();
+  const quar = qQuarGet.get(bottleId);
+  return {
+    bottle: b.id,
+    kind: b.kind,
+    created_time: b.created_time,
+    created_by_op: b.created_op || null,
+    ledger_version: ledgerVersion(),
+    lineage: lineage(bottleId),
+    formation_ops: ops,
+    balances: chainBottles.map((id) => ({ bottle: id, remaining: balances.get(id) ?? 0 })),
+    contributions: contributionReport(ledgerCompositionIndex(), b),
+    quarantine: {
+      self: quar ? { reason: quar.reason, updated_at: quar.updated_at } : null,
+      affected: impact.has(bottleId),
+      hits: impact.get(bottleId) || [],
+    },
+  };
+}
+
+/** 封存记录行 → API 响应（evidence 原样解析返回）。 */
+function sealRecordJson(row) {
+  return {
+    seal_id: row.seal_id,
+    bottle: row.bottle_id,
+    sealed_at: row.sealed_at,
+    ledger_version: row.ledger_version,
+    digest: row.digest,
+    evidence: JSON.parse(row.evidence),
+  };
+}
+
+/**
+ * 新建证据封存（事务）：在同一已提交台账状态下固化目标瓶的形成证据，
+ * 返回封存时间与内容摘要（证据规范化 JSON 的 SHA-256）。
+ * 只写 evidence_seals 表：不修改台账、不重算余量、不递增台账版本，
+ * 已发放的批次提交凭据与更正确认凭据不受影响。
+ * 同号同目标 → 幂等返回原封存；同号异目标 → 409；
+ * 目标不存在或取证失败 → 抛错回滚，该封存号不被占用。
+ */
+const createSeal = db.transaction((sealId, bottleId) => {
+  const existing = qSealGet.get(sealId);
+  if (existing) {
+    if (existing.bottle_id === bottleId) {
+      return { ...sealRecordJson(existing), ok: true, idempotent: true,
+               message: `封存号 ${sealId} 已对瓶 ${bottleId} 封存过（封存时间 ${existing.sealed_at}），幂等返回原封存，未重新取证` };
+    }
+    throw new ApiError(409, 'SEAL_CONFLICT',
+      `封存号 ${sealId} 已用于瓶 ${existing.bottle_id}，不能再对瓶 ${bottleId} 封存，请更换封存号`);
+  }
+  const evidence = buildEvidence(bottleId); // 目标不存在 / 取证失败在此抛错，事务回滚不占号
+  const sealedAt = new Date().toISOString();
+  const digest = sha256Hex(canonicalJson(evidence));
+  qSealIns.run(sealId, bottleId, evidence.ledger_version, sealedAt, digest, JSON.stringify(evidence));
+  return {
+    ok: true, idempotent: false, seal_id: sealId, bottle: bottleId,
+    sealed_at: sealedAt, ledger_version: evidence.ledger_version, digest, evidence,
+    message: `瓶 ${bottleId} 的形成证据已封存（封存号 ${sealId}，台账版本 ${evidence.ledger_version}）；封存不改变台账与余量，内容随后不可改写`,
+  };
+});
+
+/**
+ * 逐项比较已封存证据与按当前台账重算的证据：来源关系（形成操作的来源边）、取用量、
+ * 余量、原瓶贡献、隔离命中的新增（added）/ 消失（removed）/ 变化（changed）；
+ * 未变化项不列出。返回的 changes 为空对象即“与现况一致”。
+ */
+function diffEvidence(sealed, current) {
+  const changes = {};
+  const byKey = (arr, keyFn) => { const m = new Map(); for (const x of arr) m.set(keyFn(x), x); return m; };
+  const sortBy = (arr, ...keys) => arr.sort((a, b) => {
+    for (const k of keys) { if (a[k] < b[k]) return -1; if (a[k] > b[k]) return 1; }
+    return 0;
+  });
+
+  // —— 来源关系（形成操作 → 来源瓶 的边）与取用量 ——
+  const edgesOf = (ev) => {
+    const m = new Map();
+    for (const op of ev.formation_ops) {
+      for (const s of op.sources) {
+        m.set(op.op_id + '→' + s.bottle, {
+          op_id: op.op_id, target_bottle: op.target_bottle, source_bottle: s.bottle, volume: s.volume,
+        });
+      }
+    }
+    return m;
+  };
+  const e0 = edgesOf(sealed); const e1 = edgesOf(current);
+  const linAdded = []; const linRemoved = []; const volChanged = [];
+  for (const [k, e] of e1) { if (!e0.has(k)) linAdded.push(e); }
+  for (const [k, e] of e0) {
+    const now = e1.get(k);
+    if (!now) linRemoved.push(e);
+    else if (now.volume !== e.volume) {
+      volChanged.push({ op_id: e.op_id, target_bottle: e.target_bottle, source_bottle: e.source_bottle, before: e.volume, after: now.volume });
+    }
+  }
+  sortBy(linAdded, 'op_id', 'source_bottle'); sortBy(linRemoved, 'op_id', 'source_bottle'); sortBy(volChanged, 'op_id', 'source_bottle');
+  const lineageCh = {};
+  if (linAdded.length) lineageCh.added = linAdded;
+  if (linRemoved.length) lineageCh.removed = linRemoved;
+  if (Object.keys(lineageCh).length) changes.lineage = lineageCh;
+  if (volChanged.length) changes.volumes = { changed: volChanged };
+
+  // —— 余量（目标瓶及来源链各瓶）——
+  const b0 = byKey(sealed.balances, (x) => x.bottle);
+  const b1 = byKey(current.balances, (x) => x.bottle);
+  const balAdded = []; const balRemoved = []; const balChanged = [];
+  for (const [id, x] of b1) { if (!b0.has(id)) balAdded.push({ bottle: id, after: x.remaining }); }
+  for (const [id, x] of b0) {
+    const now = b1.get(id);
+    if (!now) balRemoved.push({ bottle: id, before: x.remaining });
+    else if (now.remaining !== x.remaining) balChanged.push({ bottle: id, before: x.remaining, after: now.remaining });
+  }
+  sortBy(balAdded, 'bottle'); sortBy(balRemoved, 'bottle'); sortBy(balChanged, 'bottle');
+  const balCh = {};
+  if (balAdded.length) balCh.added = balAdded;
+  if (balRemoved.length) balCh.removed = balRemoved;
+  if (balChanged.length) balCh.changed = balChanged;
+  if (Object.keys(balCh).length) changes.balances = balCh;
+
+  // —— 精确原瓶贡献（约分分数 mL；按分子 / 分母精确比较）——
+  const c0 = byKey(sealed.contributions.contributions, (x) => x.bottle);
+  const c1 = byKey(current.contributions.contributions, (x) => x.bottle);
+  const sameFrac = (a, b) => a.numerator === b.numerator && a.denominator === b.denominator;
+  const conAdded = []; const conRemoved = []; const conChanged = [];
+  for (const [id, x] of c1) { if (!c0.has(id)) conAdded.push({ bottle: id, contribution_ml: x.contribution_ml }); }
+  for (const [id, x] of c0) {
+    const now = c1.get(id);
+    if (!now) conRemoved.push({ bottle: id, contribution_ml: x.contribution_ml });
+    else if (!sameFrac(now.contribution_ml, x.contribution_ml)) {
+      conChanged.push({ bottle: id, before: x.contribution_ml, after: now.contribution_ml });
+    }
+  }
+  sortBy(conAdded, 'bottle'); sortBy(conRemoved, 'bottle'); sortBy(conChanged, 'bottle');
+  const conCh = {};
+  if (conAdded.length) conCh.added = conAdded;
+  if (conRemoved.length) conCh.removed = conRemoved;
+  if (conChanged.length) conCh.changed = conChanged;
+  if (sealed.contributions.formation_volume !== current.contributions.formation_volume) {
+    conCh.formation_volume = { before: sealed.contributions.formation_volume, after: current.contributions.formation_volume };
+  }
+  if (Object.keys(conCh).length) changes.contributions = conCh;
+
+  // —— 隔离命中（自身隔离状态 + 命中的隔离原瓶及原因）——
+  const quarCh = {};
+  const selfBefore = sealed.quarantine.self ? sealed.quarantine.self.reason : null;
+  const selfAfter = current.quarantine.self ? current.quarantine.self.reason : null;
+  if (selfBefore !== selfAfter) quarCh.self = { before: selfBefore, after: selfAfter };
+  const h0 = byKey(sealed.quarantine.hits, (x) => x.bottle);
+  const h1 = byKey(current.quarantine.hits, (x) => x.bottle);
+  const hitAdded = []; const hitRemoved = []; const hitChanged = [];
+  for (const [id, x] of h1) { if (!h0.has(id)) hitAdded.push({ bottle: id, reason: x.reason }); }
+  for (const [id, x] of h0) {
+    const now = h1.get(id);
+    if (!now) hitRemoved.push({ bottle: id, reason: x.reason });
+    else if (now.reason !== x.reason) hitChanged.push({ bottle: id, before_reason: x.reason, after_reason: now.reason });
+  }
+  sortBy(hitAdded, 'bottle'); sortBy(hitRemoved, 'bottle'); sortBy(hitChanged, 'bottle');
+  const hitsCh = {};
+  if (hitAdded.length) hitsCh.added = hitAdded;
+  if (hitRemoved.length) hitsCh.removed = hitRemoved;
+  if (hitChanged.length) hitsCh.changed = hitChanged;
+  if (Object.keys(hitsCh).length) quarCh.hits = hitsCh;
+  if (Object.keys(quarCh).length) changes.quarantine = quarCh;
+
+  return changes;
+}
+
 // ---------------------------------------------------------------- HTTP 层
 
 const app = express();
@@ -1160,6 +1407,69 @@ app.get('/api/operations', wrap((req, res) => {
     const list = byOp[o.op_id] || [];
     return { ...o, sources: list, total: list.reduce((a, s) => a + s.volume, 0) };
   }));
+}));
+
+// ---------------------------------------------------------------- 证据封存 HTTP 接口
+
+/**
+ * 新建证据封存：{seal_id, bottle}。在同一已提交台账状态下固化目标瓶的形成证据
+ * （完整来源谱系、各形成操作时间与取用量、当时余量、精确原瓶贡献、隔离命中），
+ * 返回封存时间与内容摘要（SHA-256）。封存不修改台账、不递增台账版本，
+ * 已发放的批次提交 / 更正确认凭据不受影响。
+ * 同号同目标 → 200 幂等返回原封存；同号异目标 → 409 SEAL_CONFLICT；
+ * 目标不存在 → 404 BOTTLE_NOT_FOUND；取证失败（谱系不完整 / 循环）→ 409；失败均不占号。
+ */
+app.post('/api/seals', wrap((req, res) => {
+  const sealId = normId(req.body && req.body.seal_id, '封存号');
+  const bottleId = normId(req.body && req.body.bottle, '目标瓶编号');
+  const result = createSeal(sealId, bottleId);
+  res.status(result.idempotent ? 200 : 201).json(result);
+}));
+
+/** 全部封存摘要（不含证据正文）。 */
+app.get('/api/seals', wrap((req, res) => {
+  res.json(qSealAll.all().map((r) => ({
+    seal_id: r.seal_id, bottle: r.bottle_id, sealed_at: r.sealed_at,
+    ledger_version: r.ledger_version, digest: r.digest,
+  })));
+}));
+
+/**
+ * 按封存号查询原样证据。封存内容一旦落库不再更新：
+ * 后续分装 / 混样、历史更正、隔离设置或解除都不会改写已封存证据。
+ */
+app.get('/api/seals/:sealId', wrap((req, res) => {
+  const row = qSealGet.get(req.params.sealId);
+  if (!row) throw new ApiError(404, 'SEAL_NOT_FOUND', `封存号 ${req.params.sealId} 不存在`);
+  res.json(sealRecordJson(row));
+}));
+
+/**
+ * 与现况比较：从同一当前台账状态用与封存相同的构建器重算目标瓶的形成证据，
+ * 逐项列出来源关系、取用量、余量、原瓶贡献、隔离命中的新增 / 消失 / 变化；
+ * 未变化项不列出，完全一致时 changed=false 且 changes={}。
+ */
+app.get('/api/seals/:sealId/compare', wrap((req, res) => {
+  const row = qSealGet.get(req.params.sealId);
+  if (!row) throw new ApiError(404, 'SEAL_NOT_FOUND', `封存号 ${req.params.sealId} 不存在`);
+  const sealed = JSON.parse(row.evidence);
+  const current = buildEvidence(row.bottle_id); // 与封存同一构建器、同一口径
+  const changes = diffEvidence(sealed, current);
+  const changed = Object.keys(changes).length > 0;
+  res.json({
+    seal_id: row.seal_id,
+    bottle: row.bottle_id,
+    sealed_at: row.sealed_at,
+    digest: row.digest,
+    sealed_ledger_version: row.ledger_version,
+    current_ledger_version: ledgerVersion(),
+    compared_at: new Date().toISOString(),
+    changed,
+    changes,
+    message: changed
+      ? '目标瓶现况与封存证据存在差异，详见 changes（仅列出新增 / 消失 / 变化项）'
+      : '目标瓶现况与封存证据一致：来源关系、取用量、余量、原瓶贡献、隔离命中均无变化',
+  });
 }));
 
 // ---------------------------------------------------------------- 批次 HTTP 接口

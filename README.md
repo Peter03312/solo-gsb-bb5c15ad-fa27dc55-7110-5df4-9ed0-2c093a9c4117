@@ -2,7 +2,8 @@
 
 基于 **Node.js + Express + SQLite（better-sqlite3）** 的 Web 工作台，用于管理水质样本的
 原瓶登记、分装 / 混样操作、**批次预演与两阶段提交**、余量守恒校验、完整来源谱系追溯、
-历史操作更正与**更正预演 / 确认两阶段**、**原瓶质检隔离与影响范围拦截**。
+历史操作更正与**更正预演 / 确认两阶段**、**原瓶质检隔离与影响范围拦截**、
+**形成证据封存与复核比较**。
 
 ## 一键启动（Docker Compose）
 
@@ -50,6 +51,9 @@ npm start          # 访问 http://localhost:3000
 - **质检隔离**：对原始瓶设置隔离（原因必填）或解除隔离；实时展示当前隔离原瓶列表与
   **受影响瓶范围**（每瓶命中的隔离原瓶及原因）。瓶子总览与瓶详情同步标注
   “隔离中 / 受影响”状态。
+- **证据封存**：凭唯一封存号固化指定已登记瓶的形成证据（完整来源谱系、各形成操作的时间与
+  取用量、当时余量、精确原瓶贡献、隔离命中），返回封存时间与内容摘要（SHA-256）；
+  支持按封存号**查看原样证据**及**与现况比较**（逐项列出新增 / 消失 / 变化，未变化项不列出）。
 
 ## 批次处理（本轮新增）
 
@@ -248,6 +252,79 @@ curl -s -X DELETE http://localhost:3000/api/bottles/W2026-001/quarantine
 `quarantine`（自身隔离状态，仅原瓶）、`affected`、`quarantine_hits`（命中的隔离原瓶及原因）字段；
 工作台“瓶子总览 / 瓶详情 / 质检隔离”页同步展示。
 
+## 证据封存与复核比较（本轮新增）
+
+质检复核时，可凭**唯一封存号 + 目标瓶编号**把某个已登记瓶在**同一已提交台账状态**下的
+形成证据原样固化到独立的 `evidence_seals` 表（只读台账、只写证据表）：
+
+- **封存内容**：向上至原瓶的完整来源谱系（`lineage`）、各形成操作的操作号 / 时间 / 目标瓶 /
+  来源与取用量（`formation_ops`）、目标瓶及来源链各瓶的**当时余量**（`balances`）、
+  **精确原瓶贡献**（`contributions`，沿用约分分数 mL 格式）、**隔离命中**
+  （`quarantine`：自身隔离状态 + 命中的隔离原瓶及原因），以及封存时台账版本。
+- **返回**：封存时间 `sealed_at` 与内容摘要 `digest`（证据规范化 JSON 的 SHA-256，
+  同一证据内容摘要恒定）。
+- **不改台账**：封存不修改台账、不重算余量、**不递增台账版本**，已发放的批次提交凭据与
+  更正确认凭据不受影响（封存后确认仍可成功）。
+- **幂等与冲突**：同号同目标重试 → 200 幂等返回**原封存**（原封存时间、原摘要、原证据，
+  即使台账已变也返回封存时的内容）；同号异目标 → 409 `SEAL_CONFLICT`；
+  目标不存在 → 404 `BOTTLE_NOT_FOUND`；取证失败（谱系不完整 / 循环引用）→ 409；
+  **失败均不占号**（事务回滚，同一封存号可再用于有效目标）。
+- **不可改写**：封存内容一旦落库不再更新，后续分装 / 混样、历史更正、隔离设置 / 解除
+  都不会改写已封存证据；`GET /api/seals/:seal_id` 永远返回原样证据。
+- **与现况比较**：`GET /api/seals/:seal_id/compare` 从**同一当前台账状态**用与封存完全相同的
+  构建器重算目标瓶，逐项列出**来源关系、取用量、余量、原瓶贡献、隔离命中**的
+  新增（`added`）/ 消失（`removed`）/ 变化（`changed`）；**未变化项不列出**，
+  完全一致时 `changed: false`、`changes: {}`。
+
+### 调用示例
+
+```bash
+# 1) 封存瓶 ALQ-001 的形成证据 → 201
+curl -s http://localhost:3000/api/seals -H 'Content-Type: application/json' -d '{
+  "seal_id": "SEAL-0001", "bottle": "ALQ-001"}'
+# → {"ok":true,"idempotent":false,"seal_id":"SEAL-0001","bottle":"ALQ-001",
+#    "sealed_at":"2026-10-05T08:30:00.000Z","ledger_version":1,
+#    "digest":"be3026de…(SHA-256)",
+#    "evidence":{"bottle":"ALQ-001","kind":"derived","ledger_version":1,
+#      "lineage":{…向上至原瓶的谱系树…},
+#      "formation_ops":[{"op_id":"OP-0001","op_time":"2026-10-01T10:00:00",
+#        "target_bottle":"MIX-001","sources":[{"bottle":"W2026-001","volume":200},…]},…],
+#      "balances":[{"bottle":"ALQ-001","remaining":100},{"bottle":"MIX-001","remaining":250},…],
+#      "contributions":{"formation_volume":100,"contributions":[
+#        {"bottle":"W2026-001","contribution_ml":{"numerator":"400","denominator":"7",
+#         "text":"400/7","approx_ml":57.14…}},…],"sum_ml":{…}},
+#      "quarantine":{"self":null,"affected":false,"hits":[]}}}
+#    同号同目标重试 → 200 {"idempotent":true, …原封存内容…}
+#    同号异目标 → 409 SEAL_CONFLICT；目标不存在 → 404 且不占号
+
+# 2) 按封存号查询原样证据（不受后续任何台账变动影响）
+curl -s http://localhost:3000/api/seals/SEAL-0001
+
+# 3) 与现况比较（同一当前台账状态重算，仅列出差异项）
+curl -s http://localhost:3000/api/seals/SEAL-0001/compare
+# → {"changed":true,"sealed_ledger_version":1,"current_ledger_version":4,
+#    "compared_at":"2026-10-05T09:00:00.000Z",
+#    "changes":{
+#      "lineage":{"added":[{"op_id":"OP-0002","target_bottle":"ALQ-001",
+#                          "source_bottle":"W2026-003","volume":50}]},
+#      "volumes":{"changed":[{"op_id":"OP-0001","target_bottle":"MIX-001",
+#                             "source_bottle":"W2026-001","before":200,"after":250}]},
+#      "balances":{"changed":[{"bottle":"W2026-001","before":800,"after":750}],
+#                  "added":[{"bottle":"W2026-003","after":450}]},
+#      "contributions":{"changed":[{"bottle":"W2026-001",
+#         "before":{"numerator":"400","denominator":"7","text":"400/7",…},
+#         "after":{"numerator":"500","denominator":"7","text":"500/7",…}}]},
+#      "quarantine":{"hits":{"added":[{"bottle":"W2026-001","reason":"检出重金属超标"}]}}}}
+#    完全一致时 → {"changed":false,"changes":{},…}
+
+# 4) 封存列表（摘要，不含证据正文）
+curl -s http://localhost:3000/api/seals
+# → [{"seal_id":"SEAL-0001","bottle":"ALQ-001","sealed_at":"…","ledger_version":1,"digest":"…"}]
+```
+
+工作台“证据封存”页支持：新建封存、查看原样证据（谱系树 / 形成操作 / 当时余量 / 精确贡献 /
+隔离命中）、与现况比较（按来源关系、取用量、余量、贡献、隔离命中分组展示差异）。
+
 ## 业务规则与一致性设计
 
 - **唯一操作号 + 幂等**：`op_id` 为主键。同一操作号重复提交**相同内容**时幂等返回
@@ -274,6 +351,12 @@ curl -s -X DELETE http://localhost:3000/api/bottles/W2026-001/quarantine
   更正在原有守恒规则下照常执行，不被隔离拦截。隔离状态变动递增台账版本，
   使未使用的批次提交 / 更正确认凭据失效；幂等判定（批次号 + 计划哈希、确认凭据哈希、
   操作号 + 内容）先于凭据版本校验，已成功提交的相同请求重试不受版本变化影响。
+- **证据封存**：封存把目标瓶在当前已提交台账状态下的形成证据（谱系、形成操作、当时余量、
+  精确原瓶贡献、隔离命中）原样写入 `evidence_seals` 表并计算 SHA-256 内容摘要；
+  只读台账、只写证据表，不递增台账版本，已发放凭据不受影响。同号同目标幂等返回原封存，
+  同号异目标 409；目标不存在或取证失败时事务回滚、不占号。封存记录无任何更新接口，
+  后续分装、更正、隔离变动均不改写；比较接口每次用与封存相同的构建器从当前台账重算，
+  逐项对照来源关系 / 取用量 / 余量 / 贡献 / 隔离命中，未变化项不列出。
 - **并发守恒**：better-sqlite3 为同步驱动，所有写操作包裹在事务中串行执行，
   并发争用同一来源瓶时不会出现超扣；已用并发压测验证（10 并发争用 400 mL，
   恰好 4 笔成功、余量归零不为负；5 并发重复提交同一操作号仅扣量一次；
@@ -301,6 +384,10 @@ curl -s -X DELETE http://localhost:3000/api/bottles/W2026-001/quarantine
 | `DELETE` | `/api/bottles/:id/quarantine` | **（新增）** 解除原瓶隔离 → 200；未隔离 409 `NOT_QUARANTINED` |
 | `GET` | `/api/quarantines` | **（新增）** 当前全部隔离原瓶及原因、设置时间 |
 | `GET` | `/api/quarantines/impact` | **（新增）** 隔离影响范围：按当前已提交来源关系列出受影响瓶，每瓶命中的隔离原瓶及原因 |
+| `POST` | `/api/seals` | **（新增）** 证据封存 `{seal_id, bottle}` → 201 + 封存时间与内容摘要（SHA-256）；同号同目标 200 幂等返回原封存；同号异目标 409 `SEAL_CONFLICT`；目标不存在 404 / 取证失败 409，均不占号；不写台账、不递增台账版本 |
+| `GET` | `/api/seals` | **（新增）** 全部封存摘要（封存号、目标瓶、封存时间、台账版本、内容摘要） |
+| `GET` | `/api/seals/:seal_id` | **（新增）** 按封存号查询原样证据（谱系、形成操作、当时余量、精确贡献、隔离命中），内容永不改写；封存号不存在 404 |
+| `GET` | `/api/seals/:seal_id/compare` | **（新增）** 与现况比较：同一当前台账状态重算目标瓶，逐项列出来源关系 / 取用量 / 余量 / 贡献 / 隔离命中的新增、消失或变化（未变化项不列出） |
 | `GET` | `/api/bottles/:id/contributions` | **（新增）** 各原始瓶对该瓶的精确贡献量：原瓶编号、约分分数 mL、形成时总体积与合计；瓶不存在 404 |
 | `GET` | `/api/operations` | 全部操作记录（含来源明细、目标体积与所属批次号 `batch_id`） |
 
@@ -312,6 +399,6 @@ curl -s -X DELETE http://localhost:3000/api/bottles/W2026-001/quarantine
 ├── Dockerfile            # node:20，构建时安装依赖，启动时确保依赖并初始化数据
 ├── docker-compose.yml    # 一键启动，映射 3000 端口，named volume 持久化数据
 ├── package.json
-├── server.js             # Express 服务 + SQLite 台账 + 守恒校验 + 谱系查询 + 批次预演/提交 + 原瓶贡献量（精确分数）+ 更正预演/确认 + 原瓶隔离与影响范围拦截
-└── public/index.html     # 单页工作台（总览 / 登记 / 操作 / 批量预演提交 / 记录与更正（预演+确认）/ 贡献量展示 / 质检隔离）
+├── server.js             # Express 服务 + SQLite 台账 + 守恒校验 + 谱系查询 + 批次预演/提交 + 原瓶贡献量（精确分数）+ 更正预演/确认 + 原瓶隔离与影响范围拦截 + 证据封存与复核比较
+└── public/index.html     # 单页工作台（总览 / 登记 / 操作 / 批量预演提交 / 记录与更正（预演+确认）/ 贡献量展示 / 质检隔离 / 证据封存）
 ```

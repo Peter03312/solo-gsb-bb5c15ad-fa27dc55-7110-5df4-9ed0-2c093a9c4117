@@ -57,7 +57,7 @@ h4{margin:14px 0 6px;font-size:14px}
 <body>
 <header>
   <h1>水质实验室 · 样本分装与混样溯源工作台</h1>
-  <p>原瓶登记 / 分装混样 / 批次预演与提交 / 余量守恒 / 谱系溯源 / 历史更正（预演 + 确认两阶段，冲突自动回滚）/ 质检隔离与影响范围</p>
+  <p>原瓶登记 / 分装混样 / 批次预演与提交 / 余量守恒 / 谱系溯源 / 历史更正（预演 + 确认两阶段，冲突自动回滚）/ 质检隔离与影响范围 / 证据封存与复核比较</p>
 </header>
 <nav>
   <button data-tab="bottles" class="active">瓶子总览</button>
@@ -66,6 +66,7 @@ h4{margin:14px 0 6px;font-size:14px}
   <button data-tab="batch">批量预演 / 提交</button>
   <button data-tab="ops">操作记录与更正</button>
   <button data-tab="quarantine">质检隔离</button>
+  <button data-tab="seals">证据封存</button>
 </nav>
 <main>
 <div id="msg" class="msg"></div>
@@ -190,6 +191,32 @@ h4{margin:14px 0 6px;font-size:14px}
     </table>
   </div>
 </section>
+
+<!-- ============ 证据封存 ============ -->
+<section id="tab-seals" style="display:none">
+  <div class="card">
+    <h3>新建证据封存</h3>
+    <div class="grid2">
+      <div><label>封存号（唯一；同号同目标重试返回原封存，异目标冲突）</label><input id="seal_id" type="text" placeholder="如 SEAL-0001"></div>
+      <div><label>目标瓶编号（已登记瓶）</label><input id="seal_bottle" type="text" list="bottleList" placeholder="如 ALQ-001"></div>
+    </div>
+    <p><button class="btn" id="sealCreate">封存</button></p>
+    <p class="hint">封存在同一已提交台账状态下固化该瓶向上至原瓶的完整来源关系、各形成操作的时间与取用量、
+      当时余量、精确原瓶贡献（分数 mL）及隔离命中，返回封存时间与内容摘要（SHA-256）。
+      封存不写入台账、不改变余量，已发放的批次提交 / 更正确认凭据不受影响；
+      目标不存在或取证失败不会占用封存号；封存内容随后不会被分装、历史更正或隔离变动改写。</p>
+  </div>
+  <div class="card">
+    <h3>已封存证据</h3>
+    <table id="sealTable">
+      <thead><tr><th>封存号</th><th>目标瓶</th><th>封存时间</th><th class="num">台账版本</th><th>内容摘要 (SHA-256)</th><th></th></tr></thead>
+      <tbody></tbody>
+    </table>
+    <p class="hint">“查看”按封存号返回原样证据；“与现况比较”从同一当前台账状态重算目标瓶，
+      逐项列出来源关系、取用量、余量、贡献和隔离命中的新增 / 消失 / 变化（未变化项不列出）。</p>
+  </div>
+  <div class="card" id="sealDetail" style="display:none"></div>
+</section>
 </main>
 
 <datalist id="bottleList"></datalist>
@@ -245,6 +272,7 @@ document.querySelectorAll('nav button').forEach(btn => {
     if (btn.dataset.tab === 'bottles') loadBottles();
     if (btn.dataset.tab === 'ops') loadOps();
     if (btn.dataset.tab === 'quarantine') loadQuarantine();
+    if (btn.dataset.tab === 'seals') loadSeals();
   });
 });
 
@@ -775,10 +803,200 @@ $('qSet').addEventListener('click', async () => {
   }
 });
 
+// ---------- 证据封存 ----------
+async function loadSeals() {
+  const rows = await api('/api/seals');
+  const tb = document.querySelector('#sealTable tbody');
+  tb.innerHTML = '';
+  if (!rows.length) {
+    tb.innerHTML = '<tr><td colspan="6" class="hint">暂无封存记录。</td></tr>';
+    return;
+  }
+  for (const s of rows) {
+    const tr = document.createElement('tr');
+    tr.innerHTML =
+      `<td class="mono">${escapeHtml(s.seal_id)}</td>` +
+      `<td class="mono">${escapeHtml(s.bottle)}</td>` +
+      `<td>${escapeHtml(s.sealed_at)}</td>` +
+      `<td class="num">${s.ledger_version}</td>` +
+      `<td class="mono" title="${escapeHtml(s.digest)}">${escapeHtml(s.digest.slice(0, 16))}…</td>` +
+      `<td><button class="btn secondary small act-view">查看</button> ` +
+      `<button class="btn secondary small act-compare">与现况比较</button></td>`;
+    tr.querySelector('.act-view').addEventListener('click', () => showSeal(s.seal_id));
+    tr.querySelector('.act-compare').addEventListener('click', () => compareSeal(s.seal_id));
+    tb.appendChild(tr);
+  }
+}
+
+$('sealCreate').addEventListener('click', async () => {
+  clearMsg();
+  $('sealCreate').disabled = true;
+  try {
+    const r = await api('/api/seals', 'POST', { seal_id: $('seal_id').value, bottle: $('seal_bottle').value });
+    showMsg('ok', r.message + (r.idempotent ? '（幂等）' : ''));
+    renderSealRecord(r, '封存结果');
+    loadSeals();
+  } catch (e) {
+    showMsg('err', e.message, e.details);
+  } finally {
+    $('sealCreate').disabled = false;
+  }
+});
+
+async function showSeal(sealId) {
+  clearMsg();
+  try {
+    const r = await api('/api/seals/' + encodeURIComponent(sealId));
+    renderSealRecord(r, '原样证据');
+  } catch (e) {
+    showMsg('err', e.message, e.details);
+  }
+}
+
+async function compareSeal(sealId) {
+  clearMsg();
+  try {
+    const r = await api('/api/seals/' + encodeURIComponent(sealId) + '/compare');
+    renderSealCompare(r);
+  } catch (e) {
+    showMsg('err', e.message, e.details);
+  }
+}
+
+function renderSealRecord(rec, title) {
+  const el = $('sealDetail');
+  el.style.display = '';
+  const ev = rec.evidence;
+  let html = `<h3>${escapeHtml(title)}：封存号 <span class="mono">${escapeHtml(rec.seal_id)}</span></h3>
+    <p>目标瓶：<span class="mono">${escapeHtml(rec.bottle)}</span>（${ev.kind === 'original' ? '原始瓶' : '衍生瓶'}）
+    　封存时间：<span class="mono">${escapeHtml(rec.sealed_at)}</span>
+    　封存时台账版本：${rec.ledger_version}<br>
+    内容摘要（SHA-256）：<span class="mono">${escapeHtml(rec.digest)}</span></p>`;
+  html += '<h4>隔离命中（封存时）</h4>';
+  if (ev.quarantine.self) {
+    html += `<p><span class="tag quar">隔离中</span> 自身原因：${escapeHtml(ev.quarantine.self.reason)}</p>`;
+  }
+  if (ev.quarantine.hits && ev.quarantine.hits.length) {
+    html += `<p class="low">命中隔离原瓶：${hitsHtml(ev.quarantine.hits)}</p>`;
+  } else if (!ev.quarantine.self) {
+    html += '<p class="hint">未命中任何隔离原瓶。</p>';
+  }
+  html += `<h4>完整来源谱系（向上至原瓶）</h4>${renderLineage(ev.lineage)}`;
+  html += '<h4>各形成操作的时间与取用量</h4>';
+  if (ev.formation_ops.length) {
+    html += '<table><thead><tr><th>操作号</th><th>操作时间</th><th>目标瓶</th><th>来源（瓶 × 取用量）</th></tr></thead><tbody>';
+    for (const op of ev.formation_ops) {
+      html += `<tr><td class="mono">${escapeHtml(op.op_id)}</td><td>${escapeHtml(op.op_time)}</td>` +
+        `<td class="mono">${escapeHtml(op.target_bottle)}</td>` +
+        `<td>${op.sources.map(s => `<span class="mono">${escapeHtml(s.bottle)}</span> × ${s.volume} mL`).join('<br>')}</td></tr>`;
+    }
+    html += '</tbody></table>';
+  } else {
+    html += '<p class="hint">原始瓶，无形成操作。</p>';
+  }
+  html += '<h4>当时余量（目标瓶及来源链各瓶）</h4>' +
+    '<table><thead><tr><th>瓶编号</th><th class="num">封存时余量 (mL)</th></tr></thead><tbody>';
+  for (const b of ev.balances) {
+    html += `<tr><td class="mono">${escapeHtml(b.bottle)}</td><td class="num">${b.remaining}</td></tr>`;
+  }
+  html += '</tbody></table>';
+  html += `<h4>精确原瓶贡献（分数 mL；形成时总体积 ${ev.contributions.formation_volume} mL）</h4>` +
+    renderContributions(ev.contributions);
+  el.innerHTML = html;
+  el.scrollIntoView({ behavior: 'smooth' });
+}
+
+function renderSealCompare(r) {
+  const el = $('sealDetail');
+  el.style.display = '';
+  let html = `<h3>与现况比较：封存号 <span class="mono">${escapeHtml(r.seal_id)}</span></h3>
+    <p>目标瓶：<span class="mono">${escapeHtml(r.bottle)}</span>
+    　封存时间：<span class="mono">${escapeHtml(r.sealed_at)}</span>（台账版本 ${r.sealed_ledger_version}）
+    　比较时间：<span class="mono">${escapeHtml(r.compared_at)}</span>（当前台账版本 ${r.current_ledger_version}）</p>`;
+  if (!r.changed) {
+    html += `<p class="ok-text">✓ ${escapeHtml(r.message)}</p>`;
+    el.innerHTML = html;
+    el.scrollIntoView({ behavior: 'smooth' });
+    return;
+  }
+  html += `<p class="low">✗ ${escapeHtml(r.message)}</p>`;
+  const c = r.changes;
+  if (c.lineage) {
+    html += '<h4>来源关系变化（形成操作的来源边）</h4>';
+    if (c.lineage.added) {
+      html += '<p>新增：</p><ul>' + c.lineage.added.map(e =>
+        `<li>操作 <span class="mono">${escapeHtml(e.op_id)}</span>（目标 <span class="mono">${escapeHtml(e.target_bottle)}</span>）` +
+        `新增来源 <span class="mono">${escapeHtml(e.source_bottle)}</span> × ${e.volume} mL</li>`).join('') + '</ul>';
+    }
+    if (c.lineage.removed) {
+      html += '<p>消失：</p><ul>' + c.lineage.removed.map(e =>
+        `<li>操作 <span class="mono">${escapeHtml(e.op_id)}</span>（目标 <span class="mono">${escapeHtml(e.target_bottle)}</span>）` +
+        `来源 <span class="mono">${escapeHtml(e.source_bottle)}</span> × ${e.volume} mL 已消失</li>`).join('') + '</ul>';
+    }
+  }
+  if (c.volumes) {
+    html += '<h4>取用量变化</h4><table><thead><tr><th>操作号</th><th>来源瓶</th>' +
+      '<th class="num">封存时 (mL)</th><th class="num">现况 (mL)</th></tr></thead><tbody>';
+    for (const v of c.volumes.changed) {
+      html += `<tr><td class="mono">${escapeHtml(v.op_id)}</td><td class="mono">${escapeHtml(v.source_bottle)}</td>` +
+        `<td class="num">${v.before}</td><td class="num">${v.after}</td></tr>`;
+    }
+    html += '</tbody></table>';
+  }
+  if (c.balances) {
+    html += '<h4>余量变化（目标瓶及来源链各瓶）</h4><table><thead><tr><th>瓶编号</th>' +
+      '<th class="num">封存时 (mL)</th><th class="num">现况 (mL)</th></tr></thead><tbody>';
+    for (const x of (c.balances.changed || [])) {
+      html += `<tr><td class="mono">${escapeHtml(x.bottle)}</td><td class="num">${x.before}</td><td class="num">${x.after}</td></tr>`;
+    }
+    for (const x of (c.balances.added || [])) {
+      html += `<tr><td class="mono">${escapeHtml(x.bottle)}</td><td class="num">—（新增）</td><td class="num">${x.after}</td></tr>`;
+    }
+    for (const x of (c.balances.removed || [])) {
+      html += `<tr><td class="mono">${escapeHtml(x.bottle)}</td><td class="num">${x.before}</td><td class="num">—（已消失）</td></tr>`;
+    }
+    html += '</tbody></table>';
+  }
+  if (c.contributions) {
+    html += '<h4>精确原瓶贡献变化（分数 mL）</h4>';
+    if (c.contributions.formation_volume) {
+      html += `<p>形成时总体积：${c.contributions.formation_volume.before} → ${c.contributions.formation_volume.after} mL</p>`;
+    }
+    html += '<table><thead><tr><th>原始瓶</th><th>变化</th><th class="num">封存时</th><th class="num">现况</th></tr></thead><tbody>';
+    for (const x of (c.contributions.changed || [])) {
+      html += `<tr><td class="mono">${escapeHtml(x.bottle)}</td><td>变化</td>` +
+        `<td class="num mono">${fmtFrac(x.before)}</td><td class="num mono">${fmtFrac(x.after)}</td></tr>`;
+    }
+    for (const x of (c.contributions.added || [])) {
+      html += `<tr><td class="mono">${escapeHtml(x.bottle)}</td><td>新增</td>` +
+        `<td class="num">—</td><td class="num mono">${fmtFrac(x.contribution_ml)}</td></tr>`;
+    }
+    for (const x of (c.contributions.removed || [])) {
+      html += `<tr><td class="mono">${escapeHtml(x.bottle)}</td><td>消失</td>` +
+        `<td class="num mono">${fmtFrac(x.contribution_ml)}</td><td class="num">—</td></tr>`;
+    }
+    html += '</tbody></table>';
+  }
+  if (c.quarantine) {
+    html += '<h4>隔离命中变化</h4>';
+    if (c.quarantine.self) {
+      html += `<p>自身隔离状态：${escapeHtml(c.quarantine.self.before || '（未隔离）')} → ${escapeHtml(c.quarantine.self.after || '（未隔离）')}</p>`;
+    }
+    const h = c.quarantine.hits || {};
+    if (h.added) html += '<p>新增命中：</p><ul>' + h.added.map(x => `<li>${hitsHtml([x])}</li>`).join('') + '</ul>';
+    if (h.removed) html += '<p>消失命中：</p><ul>' + h.removed.map(x => `<li>${hitsHtml([x])}</li>`).join('') + '</ul>';
+    if (h.changed) {
+      html += '<p>原因变化：</p><ul>' + h.changed.map(x =>
+        `<li><span class="mono">${escapeHtml(x.bottle)}</span>：${escapeHtml(x.before_reason)} → ${escapeHtml(x.after_reason)}</li>`).join('') + '</ul>';
+    }
+  }
+  el.innerHTML = html;
+  el.scrollIntoView({ behavior: 'smooth' });
+}
+
 // ---------- 启动 ----------
 addSourceRow($('opSources'));
 addBatchItemCard();
-loadBottles();
-</script>
+loadBottles();</script>
 </body>
 </html>
